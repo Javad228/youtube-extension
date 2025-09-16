@@ -1,45 +1,72 @@
 /* global Util */
 
 const EMOTIONS = ["funny","sad","wholesome","insightful","angry","wtf"];
+const EMOTION_EMOJI = {
+  funny: '😂',
+  sad: '😢',
+  wholesome: '😊',
+  insightful: '💡',
+  angry: '😡',
+  wtf: '🤯',
+};
+
+const DEBUG_PREFIX = '[YT Moments]';
+
+function debugLog(...args) {
+  try {
+    console.debug(DEBUG_PREFIX, ...args);
+  } catch (_) {}
+}
 
 const state = {
   videoId: null,
-  windows: [],
   comments: [],
   moments: [],
-  index: null,
   processing: false,
+  transcript: [],
+  transcriptSource: 'none',
 };
 
 function injectInpageBridge() {
   try {
+    debugLog('Injecting inpage bridge script.');
     const url = chrome.runtime.getURL('inpageBridge.js');
     const s = document.createElement('script');
     s.src = url;
     s.async = false;
     (document.documentElement || document.head || document.body).appendChild(s);
     s.addEventListener('load', () => s.remove());
-  } catch (e) {}
+    debugLog('Injected inpage bridge script.');
+  } catch (e) {
+    debugLog('Failed to inject inpage bridge script.', e);
+  }
 }
 
 const CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 
 async function loadCachedMoments(videoId) {
   try {
+    debugLog('Attempting to load cached moments.', { videoId });
     const key = `moments:${videoId}`;
     const res = await chrome.storage.local.get([key]);
     const payload = res[key];
     if (!payload) return null;
     if ((Date.now() - (payload.savedAt || 0)) > CACHE_TTL_MS) return null;
     return payload.data || null;
-  } catch (_) { return null; }
+  } catch (err) {
+    debugLog('Failed to load cached moments.', err);
+    return null;
+  }
 }
 
 async function saveCachedMoments(videoId, data) {
   try {
+    debugLog('Saving cached moments.', { videoId, count: Array.isArray(data) ? data.length : 0 });
     const key = `moments:${videoId}`;
     await chrome.storage.local.set({ [key]: { savedAt: Date.now(), data } });
-  } catch (_) {}
+  } catch (err) {
+    debugLog('Failed to save cached moments.', err);
+  }
 }
 
 function findPlayerRoot() {
@@ -52,21 +79,50 @@ function ensureOverlay() {
   if (!player) return null;
   let overlay = player.querySelector('.yt-moments-overlay');
   if (!overlay) {
+    debugLog('Creating overlay on player.');
     overlay = document.createElement('div');
     overlay.className = 'yt-moments-overlay';
     overlay.style.position = 'absolute';
     overlay.style.left = '0';
     overlay.style.right = '0';
     overlay.style.bottom = '0';
-    overlay.style.height = '6px';
+    overlay.style.height = '18px';
     player.appendChild(overlay);
     // Ensure player is positioned
     const style = getComputedStyle(player);
     if (style.position === 'static') {
       player.style.position = 'relative';
     }
+  } else {
+    debugLog('Reusing existing overlay element.');
   }
   return overlay;
+}
+
+function formatTimestamp(seconds) {
+  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const total = Math.floor(safe);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = Math.floor(total % 60).toString().padStart(2, '0');
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs}`;
+  }
+  return `${minutes}:${secs}`;
+}
+
+function formatTimeRange(start, end) {
+  return `${formatTimestamp(start)}–${formatTimestamp(end)}`;
+}
+
+function sanitizeCommentText(text) {
+  let out = text || '';
+  try {
+    if (typeof Util !== 'undefined' && typeof Util.decodeHtmlEntities === 'function') {
+      out = Util.decodeHtmlEntities(out);
+    }
+  } catch (_) {}
+  return out.replace(/\s+/g, ' ').trim();
 }
 
 function renderMarkers() {
@@ -75,65 +131,41 @@ function renderMarkers() {
   overlay.innerHTML = '';
   const duration = document.querySelector('video')?.duration || 0;
   if (!duration) return;
+  debugLog('Rendering markers onto overlay.', { duration, count: state.moments.length });
+  const video = document.querySelector('video');
   for (const m of state.moments) {
-    const leftPct = Math.max(0, Math.min(100, (m.start / duration) * 100));
+    const start = Math.max(0, Math.min(duration, m.start || 0));
+    const rawEnd = Number.isFinite(m.end) ? m.end : start + 4;
+    const end = Math.max(start + 0.5, Math.min(duration, rawEnd));
+    const leftPct = Math.max(0, Math.min(100, (start / duration) * 100));
+    const widthPct = Math.max(1, Math.min(100, ((end - start) / duration) * 100));
     const el = document.createElement('div');
-    el.className = 'marker';
+    el.className = 'segment';
     el.dataset.emotion = m.emotion || 'insightful';
     el.style.left = `${leftPct}%`;
-    el.title = `${m.title || 'Moment'} (${Math.round(m.start)}s)`;
+    el.style.width = `${widthPct}%`;
+    const range = formatTimeRange(start, end);
+    el.title = `${m.title || 'Moment'} (${range})`;
+    const emoji = EMOTION_EMOJI[m.emotion] || '🎬';
+    const badge = document.createElement('span');
+    badge.className = 'segment-emoji';
+    badge.textContent = emoji;
+    el.appendChild(badge);
     el.addEventListener('click', () => {
-      const video = document.querySelector('video');
-      if (video) video.currentTime = m.start;
+      if (video) video.currentTime = start;
     });
     overlay.appendChild(el);
   }
 }
 
 function postMomentsUpdate() {
+  debugLog('Posting moments update to runtime.', { count: state.moments.length });
   chrome.runtime.sendMessage({ type: 'momentsUpdated', moments: state.moments });
 }
 
 function postStatus(status, extra = {}) {
+  debugLog('Posting analysis status.', { status, ...extra });
   chrome.runtime.sendMessage({ type: 'analysisStatus', status, ...extra });
-}
-
-async function gatherCaptionDebug() {
-  try {
-    // Try to read live caption tracks from player response and cache them for Util
-    let player = [];
-    try {
-      const win = window;
-      const sources = [
-        win?.ytInitialPlayerResponse,
-        win?.ytdApp?.player_?.getPlayerResponse?.(),
-        document.querySelector('ytd-player')?.playerData,
-      ];
-      for (const src of sources) {
-        const tracks = src?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (Array.isArray(tracks) && tracks.length) {
-          player = tracks.map((t) => ({
-            lang_code: t.languageCode || '',
-            kind: t.kind || '',
-            name: typeof t.name?.simpleText === 'string' ? t.name.simpleText : (t.name || ''),
-            vss_id: t.vssId || '',
-            baseUrl: t.baseUrl || '',
-            is_default: !!t.isDefault,
-          }));
-          if (typeof Util.setPlayerCaptionTracks === 'function') Util.setPlayerCaptionTracks(player);
-          break;
-        }
-      }
-    } catch (_) {}
-    if (!player.length && typeof Util.getPlayerCaptionTracks === 'function') {
-      player = (Util.getPlayerCaptionTracks() || []);
-    }
-    const list = (typeof Util.listCaptionTracks === 'function' && state.videoId) ? (await Util.listCaptionTracks(state.videoId)) : [];
-    const summarize = (arr) => arr.map(t => ({
-      lang: t.lang_code || '', kind: t.kind || '', name: t.name || '', vss: !!t.vss_id, base: !!t.baseUrl, def: !!t.is_default
-    }));
-    return { player: summarize(player), list: summarize(list) };
-  } catch (_) { return { player: [], list: [] }; }
 }
 
 async function getApiKey() {
@@ -152,8 +184,12 @@ async function fetchTopComments(videoId) {
   url.searchParams.set('maxResults', '50');
   url.searchParams.set('key', key);
   try {
+    debugLog('Fetching top comments from API.', { videoId, url: url.toString() });
     const res = await fetch(url.toString());
-    if (!res.ok) return [];
+    if (!res.ok) {
+      debugLog('Top comments fetch failed.', { status: res.status });
+      return [];
+    }
     const json = await res.json();
     const out = [];
     for (const item of json.items || []) {
@@ -167,13 +203,18 @@ async function fetchTopComments(videoId) {
         author: s.authorDisplayName,
       });
     }
+    debugLog('Fetched top comments.', { count: out.length });
     return out;
-  } catch (_) { return []; }
+  } catch (err) {
+    debugLog('Error fetching top comments.', err);
+    return [];
+  }
 }
 
-function buildIndex(windows) {
-  // Simple TF score index
-  const docs = windows.map((w, i) => ({ id: i, tokens: Util.tokenize(w.text) }));
+function buildIndexFromComments(comments) {
+  // Simple TF score index over comment text
+  debugLog('Building index from comments.', { count: comments.length });
+  const docs = comments.map((c, i) => ({ id: i, tokens: Util.tokenize(c.text) }));
   const df = new Map();
   for (const d of docs) {
     const seen = new Set();
@@ -186,16 +227,85 @@ function buildIndex(windows) {
       for (const term of q) {
         const idf = Math.log(1 + (docs.length + 1) / ((df.get(term) || 0) + 1));
         for (const d of docs) {
-          const tf = d.tokens.filter(t => t === term).length;
-          if (!tf) continue;
+          const docLen = d.tokens.length || 1;
+          const tfRaw = d.tokens.filter(t => t === term).length;
+          if (!tfRaw) continue;
+          const tf = tfRaw / docLen;
           const s = (scores.get(d.id) || 0) + tf * idf;
           scores.set(d.id, s);
         }
       }
-      const arr = Array.from(scores.entries()).sort((a,b)=>b[1]-a[1]).slice(0, k).map(([id, score]) => ({ id, score }));
-      return arr;
+      const entries = Array.from(scores.entries()).sort((a,b)=>b[1]-a[1]).slice(0, k);
+      const topScore = entries.length ? entries[0][1] : 1;
+      return entries.map(([id, score]) => ({ id, score, norm: topScore > 0 ? score / topScore : 0 }));
     }
   };
+}
+
+function extractTimestampSeconds(text) {
+  const normalized = (text || '').replace(/\s+/g, ' ');
+  if (!normalized) return null;
+  const colonRegex = /(\d{1,2}):(\d{2})(?::(\d{2}))?/g;
+  let match;
+  while ((match = colonRegex.exec(normalized))) {
+    const part1 = Number.parseInt(match[1], 10);
+    const part2 = Number.parseInt(match[2], 10);
+    if (Number.isNaN(part1) || Number.isNaN(part2)) continue;
+    const hasHour = match[3] != null;
+    const part3 = hasHour ? Number.parseInt(match[3], 10) : 0;
+    if (Number.isNaN(part3)) continue;
+    const hours = hasHour ? part1 : 0;
+    const minutes = hasHour ? part2 : part1;
+    const seconds = hasHour ? part3 : part2;
+    if (seconds >= 60) continue;
+    if (!hasHour && minutes >= 180) continue;
+    const total = hours * 3600 + minutes * 60 + seconds;
+    if (total >= 0) {
+      debugLog('Extracted timestamp via colon pattern.', { text, seconds: total });
+      return total;
+    }
+  }
+  const hmsRegex = /(\d+)\s*h(?:ours?)?\s*(\d+)?\s*m?(?:in(?:utes?)?)?\s*(\d+)?\s*s?/i;
+  const hmsMatch = normalized.match(hmsRegex);
+  if (hmsMatch) {
+    const hours = Number.parseInt(hmsMatch[1] || '0', 10) || 0;
+    const minutes = Number.parseInt(hmsMatch[2] || '0', 10) || 0;
+    const seconds = Number.parseInt(hmsMatch[3] || '0', 10) || 0;
+    const total = hours * 3600 + minutes * 60 + seconds;
+    if (total > 0) {
+      debugLog('Extracted timestamp via h/m/s pattern.', { text, seconds: total });
+      return total;
+    }
+  }
+  return null;
+}
+
+function clusterSimilarComments(index, comments, anchorIdx, options = {}) {
+  const anchor = comments[anchorIdx];
+  if (!anchor) return [];
+  const maxResults = options.k || 8;
+  const threshold = options.minNorm ?? 0.35;
+  const matches = index.search(anchor.text || '', maxResults);
+  debugLog('Clustering similar comments.', { anchorIdx, anchorText: anchor.text, matches: matches.length });
+  if (!matches.length) return [];
+  const cluster = [];
+  const topScore = matches.length ? matches[0].score : 0;
+  for (const m of matches) {
+    const comment = comments[m.id];
+    if (!comment) continue;
+    if (m.id === anchorIdx) {
+      cluster.push({ comment, score: 1, isAnchor: true });
+      continue;
+    }
+    const norm = m.norm != null ? m.norm : (topScore > 0 ? m.score / topScore : 0);
+    if (norm < threshold) continue;
+    cluster.push({ comment, score: norm, isAnchor: false });
+  }
+  if (!cluster.some(entry => entry.isAnchor)) {
+    cluster.unshift({ comment: anchor, score: 1, isAnchor: true });
+  }
+  debugLog('Cluster built.', { anchorIdx, clusterSize: cluster.length });
+  return cluster;
 }
 
 async function ensureAiSession() {
@@ -203,8 +313,13 @@ async function ensureAiSession() {
   try {
     const availability = await window.LanguageModel.availability();
     if (availability === 'unavailable') return null;
-    return await window.LanguageModel.create();
-  } catch (_) { return null; }
+    const session = await window.LanguageModel.create();
+    debugLog('Created AI session for prompt API.');
+    return session;
+  } catch (err) {
+    debugLog('Failed to create AI session.', err);
+    return null;
+  }
 }
 
 async function classifyEmotion(session, text) {
@@ -220,41 +335,24 @@ async function classifyEmotion(session, text) {
   const prompt = `Classify the emotion of this YouTube comment and return JSON only.\n` +
     `Comment: "${text}"\nLabels: ${EMOTIONS.join(', ')}`;
   try {
+    debugLog('Classifying emotion for text.', { length: (text || '').length });
     const res = await session.prompt(prompt, { responseConstraint: schema });
     const out = Util.safeJsonFromText(res);
-    if (out?.emotion && EMOTIONS.includes(out.emotion)) return out;
-  } catch (_) {}
-  return { emotion: 'insightful', confidence: 0.0 };
-}
-
-async function pickBestWindow(session, commentText, candidates) {
-  if (!candidates?.length) return null;
-  if (!session) {
-    const top = candidates[0];
-    if (!top) return null;
-    return { start: top.win.start, end: top.win.end, reason: 'Top lexical match' };
+    if (out?.emotion && EMOTIONS.includes(out.emotion)) {
+      debugLog('Emotion classification success.', out);
+      return out;
+    }
+    debugLog('Emotion classification returned unexpected payload.', out);
+  } catch (err) {
+    debugLog('Emotion classification failed.', err);
   }
-  const schema = {
-    type: 'object',
-    properties: { start: {type:'number'}, end:{type:'number'}, reason:{type:'string'} },
-    required: ['start','end']
-  };
-  const windowsText = candidates.map((c,i)=>`[${i}] ${Math.round(c.win.start)}-${Math.round(c.win.end)}: ${c.win.text}`).join('\n');
-  const prompt = `You get a viewer comment and K transcript windows with timestamps.\n` +
-    `Pick the single best-matching window. Return {"start":s,"end":e,"reason":...}.\n` +
-    `Comment: ${commentText}\n` +
-    `Windows:\n${windowsText}`;
-  try {
-    const res = await session.prompt(prompt, { responseConstraint: schema });
-    const out = Util.safeJsonFromText(res);
-    if (out?.start != null && out?.end != null) return out;
-  } catch (_) {}
-  return null;
+  return { emotion: 'insightful', confidence: 0.0 };
 }
 
 function scoreMoment(similarity, likes, confidence, toxicityPenalty = 0) {
   const likesNorm = Math.min(1, Math.log10(1 + likes) / 3);
   const s = 0.6 * similarity + 0.25 * likesNorm + 0.2 * confidence - 0.2 * toxicityPenalty;
+  debugLog('Scored moment.', { similarity, likes, confidence, toxicityPenalty, score: s });
   return s;
 }
 
@@ -266,7 +364,219 @@ function dedupeByTime(moments, windowSec = 8) {
     if (!last || Math.abs(m.start - last.start) > windowSec) out.push(m);
     else if ((m.score || 0) > (last.score || 0)) out[out.length-1] = m;
   }
+  debugLog('Deduped moments by time window.', { before: moments.length, after: out.length, windowSec });
   return out;
+}
+
+async function fetchTranscriptWindowsForVideo(videoId) {
+  if (!videoId) return { windows: [], source: 'none' };
+  try {
+    debugLog('Fetching transcript windows for video.', { videoId });
+    const windows = await Util.fetchTranscriptWindows(videoId, { windowSizeSec: 12 });
+    if (Array.isArray(windows) && windows.length) {
+      const sanitized = windows
+        .map(w => ({
+          start: Math.max(0, w.start || 0),
+          end: Math.max(0, w.end || 0),
+          text: sanitizeCommentText(w.text || ''),
+        }))
+        .filter(w => w.end >= w.start);
+      debugLog('Transcript windows fetched.', { count: sanitized.length });
+      return { windows: sanitized, source: 'captions' };
+    }
+    debugLog('No transcript windows returned from caption API.');
+    return { windows: [], source: 'none' };
+  } catch (err) {
+    debugLog('Transcript fetch failed.', err);
+    return { windows: [], source: 'error' };
+  }
+}
+
+function findTranscriptWindow(windows, time) {
+  if (!Array.isArray(windows) || !windows.length || !Number.isFinite(time)) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const win of windows) {
+    if (!win) continue;
+    const start = Number.isFinite(win.start) ? win.start : 0;
+    const end = Number.isFinite(win.end) ? win.end : start;
+    if (time >= start - 0.75 && time <= end + 0.75) {
+      return win;
+    }
+    const center = start + Math.max(0, end - start) / 2;
+    const dist = Math.abs(center - time);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = win;
+    }
+  }
+  if (best && bestDist <= 25) return best;
+  return null;
+}
+
+function buildSyntheticTranscriptFromComments(timestamped, duration = 0) {
+  if (!Array.isArray(timestamped) || !timestamped.length) return [];
+  const segments = [];
+  for (const entry of timestamped) {
+    if (!entry || !Number.isFinite(entry.time)) continue;
+    const text = sanitizeCommentText(entry.comment?.text || '');
+    if (!text) continue;
+    const start = Math.max(0, entry.time - 3);
+    const targetEnd = entry.time + 5;
+    const cappedEnd = duration ? Math.min(duration, targetEnd) : targetEnd;
+    segments.push({
+      start,
+      end: Math.max(start + 0.5, cappedEnd),
+      text,
+    });
+  }
+  segments.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const seg of segments) {
+    const last = merged[merged.length - 1];
+    if (last && seg.start <= last.end + 1.5) {
+      last.end = Math.max(last.end, seg.end);
+      if (seg.text && !last.text.includes(seg.text)) {
+        last.text = `${last.text} ${seg.text}`.trim();
+      }
+    } else {
+      merged.push({ ...seg });
+    }
+  }
+  debugLog('Synthesized transcript from comments.', { count: merged.length });
+  return merged;
+}
+
+function makeCommentKey(comment) {
+  const sanitized = sanitizeCommentText(comment?.text || '');
+  return `${comment?.id || ''}::${sanitized}`;
+}
+
+async function buildMomentsFromAnchors(index, anchors, transcriptWindows, session, transcriptSource, comments, videoDuration) {
+  const windows = Array.isArray(transcriptWindows) ? [...transcriptWindows].sort((a, b) => a.start - b.start) : [];
+  const aggregated = new Map();
+
+  function ensureRecord(transcriptWindow, anchor) {
+    const baseStart = transcriptWindow && Number.isFinite(transcriptWindow.start) ? transcriptWindow.start : Math.max(0, anchor.time || 0);
+    const baseEndRaw = transcriptWindow && Number.isFinite(transcriptWindow.end) ? transcriptWindow.end : (anchor.time || 0) + 6;
+    const baseEnd = Math.max(baseStart + 0.5, baseEndRaw);
+    const cappedEnd = videoDuration ? Math.min(videoDuration, baseEnd) : baseEnd;
+    const start = Math.max(0, baseStart);
+    const end = Math.max(start + 0.5, cappedEnd);
+    const key = `${transcriptWindow ? 'w' : 't'}:${start.toFixed(2)}-${end.toFixed(2)}`;
+    let record = aggregated.get(key);
+    if (!record) {
+      record = {
+        key,
+        window: transcriptWindow ? { ...transcriptWindow } : null,
+        start,
+        end,
+        commentKeys: new Set(),
+        commentTexts: new Set(),
+        sampleSet: new Set(),
+        totalLikes: 0,
+        anchors: [],
+        anchor: null,
+        anchorTimes: [],
+      };
+      aggregated.set(key, record);
+    } else {
+      if (transcriptWindow && !record.window) {
+        record.window = { ...transcriptWindow };
+      }
+      record.start = Math.min(record.start, start);
+      record.end = Math.max(record.end, end);
+    }
+    return record;
+  }
+
+  for (const anchor of anchors) {
+    const matchedWindow = findTranscriptWindow(windows, anchor.time);
+    if (matchedWindow) {
+      debugLog('Matched anchor to transcript window.', { anchorIdx: anchor.idx, time: anchor.time, windowStart: matchedWindow.start, windowEnd: matchedWindow.end });
+    } else {
+      debugLog('No transcript window for anchor, using fallback segment.', { anchorIdx: anchor.idx, time: anchor.time });
+    }
+    const record = ensureRecord(matchedWindow, anchor);
+    const cluster = clusterSimilarComments(index, comments, anchor.idx, { k: 12, minNorm: 0.25 });
+    if (!cluster.length) {
+      cluster.push({ comment: anchor.comment, score: 1, isAnchor: true });
+    }
+    record.anchors.push({ time: anchor.time, comment: anchor.comment });
+    record.anchorTimes.push(anchor.time);
+    if (!record.anchor || ((anchor.comment.likes || 0) > (record.anchor.comment?.likes || 0))) {
+      record.anchor = { time: anchor.time, comment: anchor.comment };
+    }
+    for (const entry of cluster) {
+      const comment = entry.comment || {};
+      const sanitized = sanitizeCommentText(comment.text || '');
+      if (!sanitized) continue;
+      const key = makeCommentKey(comment);
+      const isNew = !record.commentKeys.has(key);
+      if (isNew) {
+        record.commentKeys.add(key);
+        record.commentTexts.add(sanitized);
+        record.totalLikes += comment.likes || 0;
+      }
+      if (!entry.isAnchor && record.sampleSet.size < 6) {
+        record.sampleSet.add(sanitized);
+      }
+    }
+  }
+
+  const moments = [];
+  for (const record of aggregated.values()) {
+    const commentCount = record.commentKeys.size;
+    if (!commentCount) continue;
+    const anchorComment = record.anchor?.comment || {};
+    const anchorText = sanitizeCommentText(anchorComment.text || '');
+    const transcriptText = record.window?.text ? sanitizeCommentText(record.window.text) : '';
+    const commentTexts = Array.from(record.commentTexts).slice(0, 12);
+    let emotionInput = commentTexts.join(' ');
+    if (transcriptText) emotionInput = `${emotionInput} ${transcriptText}`.trim();
+    if (!emotionInput) emotionInput = anchorText;
+    const emo = await classifyEmotion(session, emotionInput || anchorText || '');
+    const titleContext = transcriptText || commentTexts.slice(0, 6).join(' ');
+    const title = await generateTitle(session, titleContext || anchorText, anchorText);
+    const sampleComments = Array.from(record.sampleSet).slice(0, 4);
+    const supportScore = Math.min(1, commentCount / 6);
+    const score = scoreMoment(supportScore, record.totalLikes, emo.confidence, 0);
+    const start = Math.max(0, record.start);
+    const end = Math.max(start + 0.5, record.end);
+    const rangeLabel = record.window ? `transcript ${formatTimeRange(start, end)}` : `around ${formatTimestamp(start)}`;
+    let reason = `${commentCount} comment${commentCount === 1 ? '' : 's'} aligned with ${rangeLabel}`;
+    if (record.window && transcriptSource === 'synthetic') {
+      reason += ' (synthetic transcript)';
+    }
+    if (!record.window && transcriptSource === 'none') {
+      reason += ' (no transcript available)';
+    }
+    moments.push({
+      start,
+      end,
+      reason,
+      emotion: emo.emotion,
+      confidence: emo.confidence,
+      comment: anchorText,
+      likes: anchorComment.likes || 0,
+      title,
+      score,
+      clusterSize: commentCount,
+      totalLikes: record.totalLikes,
+      sampleComments,
+      anchorAuthor: anchorComment.author || '',
+      anchorLikes: anchorComment.likes || 0,
+      transcriptText,
+      transcriptSource,
+      commentCount,
+      commentTimes: record.anchorTimes,
+    });
+  }
+
+  moments.sort((a, b) => b.score - a.score);
+  const limited = moments.slice(0, 30);
+  limited.sort((a, b) => a.start - b.start);
+  return limited;
 }
 
 async function generateTitle(session, text, commentText) {
@@ -277,24 +587,38 @@ async function generateTitle(session, text, commentText) {
       const summary = await summarizer.summarize(text);
       const s = typeof summary === 'string' ? summary : (summary?.summary || '');
       const line = (s || '').split('\n').map(t=>t.trim()).find(Boolean) || '';
-      if (line) return line.slice(0, 80);
+      if (line) {
+        const trimmed = line.slice(0, 80);
+        debugLog('Generated title using summarizer API.', { title: trimmed });
+        return trimmed;
+      }
     }
-  } catch (_) {}
+  } catch (err) {
+    debugLog('Summarizer API title generation failed.', err);
+  }
   // Fallback: use Prompt API to craft a short title
   if (session) {
     try {
       const schema = { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] };
       const res = await session.prompt(
         `Write a concise 4-8 word title for this video moment. Return JSON only.\n` +
-        `Transcript window: ${text}\nComment hint: ${commentText || ''}`,
+        `Context: ${text}\nAnchor comment: ${commentText || ''}`,
         { responseConstraint: schema }
       );
       const out = Util.safeJsonFromText(res);
-      if (out?.title) return String(out.title).slice(0, 80);
-    } catch (_) {}
+      if (out?.title) {
+        const trimmed = String(out.title).slice(0, 80);
+        debugLog('Generated title using prompt API.', { title: trimmed });
+        return trimmed;
+      }
+      debugLog('Prompt API returned unexpected title payload.', out);
+    } catch (err) {
+      debugLog('Prompt API title generation failed.', err);
+    }
   }
   // Heuristic fallback
   const words = (text || '').split(/\s+/).slice(0, 8).join(' ');
+  debugLog('Using heuristic title fallback.', { title: words });
   return words || 'Moment';
 }
 
@@ -302,15 +626,23 @@ async function analyze() {
   if (state.processing) return;
   state.processing = true;
   try {
+    debugLog('Starting analysis flow.');
     postStatus('starting');
     const urlVid = Util.getVideoIdFromUrl(location.href);
-    if (!urlVid) { state.processing = false; return; }
+    if (!urlVid) {
+      debugLog('No video ID detected on page.');
+      state.processing = false;
+      return;
+    }
     state.videoId = urlVid;
 
     // Try cache first
     const cached = await loadCachedMoments(state.videoId);
     if (cached?.length) {
+      debugLog('Loaded moments from cache.', { count: cached.length });
       state.moments = cached;
+      state.transcript = [];
+      state.transcriptSource = 'cache';
       renderMarkers();
       postMomentsUpdate();
       postStatus('done', { from: 'cache' });
@@ -318,20 +650,13 @@ async function analyze() {
       return;
     }
 
-    state.windows = await Util.fetchTranscriptWindows(state.videoId, { windowSizeSec: 7 });
-    if (!state.windows.length) {
-      const tracks = await gatherCaptionDebug();
-      state.moments = [];
-      renderMarkers();
-      postMomentsUpdate();
-      postStatus('noTranscript', { tracks });
-      state.processing = false;
-      return;
-    }
-    state.index = buildIndex(state.windows);
+    const transcriptPromise = fetchTranscriptWindowsForVideo(state.videoId);
+    state.transcript = [];
+    state.transcriptSource = 'none';
 
     const key = await getApiKey();
     if (!key) {
+      debugLog('No API key configured.');
       state.comments = [];
       postStatus('noApiKey');
       postMomentsUpdate();
@@ -339,42 +664,72 @@ async function analyze() {
       return;
     }
     state.comments = await fetchTopComments(state.videoId);
+    debugLog('Fetched comments list.', { count: state.comments.length });
     if (!state.comments.length) {
+      debugLog('No top comments returned from API.');
       postStatus('noComments');
+      state.moments = [];
+      renderMarkers();
+      postMomentsUpdate();
+      saveCachedMoments(state.videoId, state.moments);
+      state.processing = false;
+      return;
     }
-    const session = await ensureAiSession();
+    const timestamped = state.comments
+      .map((c, idx) => ({ idx, comment: c, time: extractTimestampSeconds(c.text) }))
+      .filter(entry => entry.time != null);
 
-    const moments = [];
-    for (const c of state.comments) {
-      const top = state.index.search(c.text, 6).map(r => ({ r, win: state.windows[r.id] }));
-      const pick = await pickBestWindow(session, c.text, top);
-      const emo = await classifyEmotion(session, c.text);
-      const similarity = top.length ? top[0].r.score : 0;
-      if (pick) {
-        const title = await generateTitle(session, top[0]?.win?.text || '', c.text);
-        const m = {
-          start: Math.max(0, pick.start),
-          end: Math.max(pick.start, pick.end),
-          reason: pick.reason || '',
-          emotion: emo.emotion,
-          confidence: emo.confidence,
-          comment: c.text,
-          likes: c.likes,
-          title,
-          score: scoreMoment(similarity, c.likes, emo.confidence, 0),
-        };
-        moments.push(m);
+    debugLog('Timestamped comments extracted.', { count: timestamped.length });
+    if (!timestamped.length) {
+      debugLog('No timestamped comments found.');
+      state.moments = [];
+      renderMarkers();
+      postMomentsUpdate();
+      postStatus('noTimestamps');
+      saveCachedMoments(state.videoId, state.moments);
+      state.processing = false;
+      return;
+    }
+
+    const index = buildIndexFromComments(state.comments);
+    const session = await ensureAiSession();
+    if (!session) debugLog('AI session unavailable, falling back to defaults.');
+
+    const transcriptResult = await transcriptPromise;
+    state.transcript = Array.isArray(transcriptResult.windows) ? transcriptResult.windows : [];
+    state.transcriptSource = transcriptResult.source || 'none';
+    debugLog('Transcript availability resolved.', { source: state.transcriptSource, count: state.transcript.length });
+
+    if (!state.transcript.length) {
+      const duration = document.querySelector('video')?.duration || 0;
+      const synthetic = buildSyntheticTranscriptFromComments(timestamped, duration);
+      if (synthetic.length) {
+        state.transcript = synthetic;
+        state.transcriptSource = 'synthetic';
+        debugLog('Using synthetic transcript derived from comments.', { count: synthetic.length });
       }
     }
 
-    const deduped = dedupeByTime(moments, 10).sort((a,b)=>b.score-a.score).slice(0, 30);
-    state.moments = deduped;
+    const sortedAnchors = [...timestamped].sort((a, b) => (b.comment.likes || 0) - (a.comment.likes || 0));
+    const videoDuration = document.querySelector('video')?.duration || 0;
+    const aggregatedMoments = await buildMomentsFromAnchors(
+      index,
+      sortedAnchors,
+      state.transcript,
+      session,
+      state.transcriptSource,
+      state.comments,
+      videoDuration
+    );
+    debugLog('Moments computed after transcript alignment.', { count: aggregatedMoments.length, transcriptSource: state.transcriptSource });
+
+    state.moments = aggregatedMoments;
     renderMarkers();
     postMomentsUpdate();
     saveCachedMoments(state.videoId, state.moments);
-    postStatus('done', { count: state.moments.length });
+    postStatus('done', { count: state.moments.length, transcriptSource: state.transcriptSource });
   } catch (err) {
-    // swallow
+    debugLog('Unexpected error during analysis.', err);
   } finally {
     state.processing = false;
   }
@@ -384,10 +739,10 @@ function handleSpaNavigation() {
   let last = location.href;
   const obs = new MutationObserver(() => {
     if (location.href !== last) {
+      debugLog('Detected SPA navigation change.', { from: last, to: location.href });
       last = location.href;
       // reset
       state.videoId = null;
-      state.windows = [];
       state.comments = [];
       state.moments = [];
       renderMarkers();
@@ -400,61 +755,26 @@ function handleSpaNavigation() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'getMoments') {
+    debugLog('Received getMoments request.');
     sendResponse({ moments: state.moments });
   }
   if (msg?.type === 'seek') {
+    debugLog('Received seek request.', { time: msg.time });
     const v = document.querySelector('video');
     if (v) v.currentTime = msg.time || 0;
   }
   if (msg?.type === 'triggerAnalyze') {
+    debugLog('Received triggerAnalyze request.');
     analyze();
-  }
-  if (msg?.type === 'forceFetchTranscript') {
-    (async () => {
-      try {
-        const vssIds = Array.isArray(msg.vssIds) ? msg.vssIds : [];
-        const windows = await Util.fetchTranscriptWindows(state.videoId || Util.getVideoIdFromUrl(location.href), {
-          windowSizeSec: 7,
-          vssIds,
-          langs: vssIds, // try these directly
-        });
-        if (windows && windows.length) {
-          state.windows = windows;
-          // Minimal mark to let user proceed: set a fake moment so UI unlocks
-          state.moments = [];
-          renderMarkers();
-          postStatus('done', { from: 'force', windows: windows.length });
-        } else {
-          postStatus('noTranscript', { forced: vssIds });
-        }
-      } catch (e) {
-        postStatus('noTranscript', { error: String(e) });
-      }
-    })();
   }
 });
 
-// Listen for in-page bridge messages to capture caption tracks ASAP
-window.addEventListener('message', (ev) => {
-  try {
-    const data = ev.data || {};
-    if (data && data.source === 'yt-moments' && data.type === 'captionTracks' && Array.isArray(data.tracks)) {
-      if (typeof Util.setPlayerCaptionTracks === 'function') Util.setPlayerCaptionTracks(
-        data.tracks.map(t => ({
-          lang_code: t.languageCode || '',
-          kind: t.kind || '',
-          name: t.name || '',
-          vss_id: t.vssId || '',
-          baseUrl: t.baseUrl || '',
-          is_default: !!t.isDefault,
-        }))
-      );
-    }
-  } catch (_) {}
-}, true);
-
 handleSpaNavigation();
 injectInpageBridge();
-setTimeout(analyze, 1200);
+debugLog('Scheduling initial analyze run.');
+setTimeout(() => {
+  debugLog('Running initial analyze.');
+  analyze();
+}, 1200);
 
 
