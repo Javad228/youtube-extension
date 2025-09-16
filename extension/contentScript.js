@@ -1,13 +1,19 @@
 /* global Util */
 
 const EMOTIONS = ["funny","sad","wholesome","insightful","angry","wtf"];
+const EMOTION_EMOJI = {
+  funny: '😂',
+  sad: '😢',
+  wholesome: '😊',
+  insightful: '💡',
+  angry: '😡',
+  wtf: '🤯',
+};
 
 const state = {
   videoId: null,
-  windows: [],
   comments: [],
   moments: [],
-  index: null,
   processing: false,
 };
 
@@ -58,7 +64,7 @@ function ensureOverlay() {
     overlay.style.left = '0';
     overlay.style.right = '0';
     overlay.style.bottom = '0';
-    overlay.style.height = '6px';
+    overlay.style.height = '14px';
     player.appendChild(overlay);
     // Ensure player is positioned
     const style = getComputedStyle(player);
@@ -82,6 +88,8 @@ function renderMarkers() {
     el.dataset.emotion = m.emotion || 'insightful';
     el.style.left = `${leftPct}%`;
     el.title = `${m.title || 'Moment'} (${Math.round(m.start)}s)`;
+    const emoji = EMOTION_EMOJI[m.emotion] || '🎬';
+    el.textContent = emoji;
     el.addEventListener('click', () => {
       const video = document.querySelector('video');
       if (video) video.currentTime = m.start;
@@ -96,44 +104,6 @@ function postMomentsUpdate() {
 
 function postStatus(status, extra = {}) {
   chrome.runtime.sendMessage({ type: 'analysisStatus', status, ...extra });
-}
-
-async function gatherCaptionDebug() {
-  try {
-    // Try to read live caption tracks from player response and cache them for Util
-    let player = [];
-    try {
-      const win = window;
-      const sources = [
-        win?.ytInitialPlayerResponse,
-        win?.ytdApp?.player_?.getPlayerResponse?.(),
-        document.querySelector('ytd-player')?.playerData,
-      ];
-      for (const src of sources) {
-        const tracks = src?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (Array.isArray(tracks) && tracks.length) {
-          player = tracks.map((t) => ({
-            lang_code: t.languageCode || '',
-            kind: t.kind || '',
-            name: typeof t.name?.simpleText === 'string' ? t.name.simpleText : (t.name || ''),
-            vss_id: t.vssId || '',
-            baseUrl: t.baseUrl || '',
-            is_default: !!t.isDefault,
-          }));
-          if (typeof Util.setPlayerCaptionTracks === 'function') Util.setPlayerCaptionTracks(player);
-          break;
-        }
-      }
-    } catch (_) {}
-    if (!player.length && typeof Util.getPlayerCaptionTracks === 'function') {
-      player = (Util.getPlayerCaptionTracks() || []);
-    }
-    const list = (typeof Util.listCaptionTracks === 'function' && state.videoId) ? (await Util.listCaptionTracks(state.videoId)) : [];
-    const summarize = (arr) => arr.map(t => ({
-      lang: t.lang_code || '', kind: t.kind || '', name: t.name || '', vss: !!t.vss_id, base: !!t.baseUrl, def: !!t.is_default
-    }));
-    return { player: summarize(player), list: summarize(list) };
-  } catch (_) { return { player: [], list: [] }; }
 }
 
 async function getApiKey() {
@@ -171,9 +141,9 @@ async function fetchTopComments(videoId) {
   } catch (_) { return []; }
 }
 
-function buildIndex(windows) {
-  // Simple TF score index
-  const docs = windows.map((w, i) => ({ id: i, tokens: Util.tokenize(w.text) }));
+function buildIndexFromComments(comments) {
+  // Simple TF score index over comment text
+  const docs = comments.map((c, i) => ({ id: i, tokens: Util.tokenize(c.text) }));
   const df = new Map();
   for (const d of docs) {
     const seen = new Set();
@@ -186,16 +156,77 @@ function buildIndex(windows) {
       for (const term of q) {
         const idf = Math.log(1 + (docs.length + 1) / ((df.get(term) || 0) + 1));
         for (const d of docs) {
-          const tf = d.tokens.filter(t => t === term).length;
-          if (!tf) continue;
+          const docLen = d.tokens.length || 1;
+          const tfRaw = d.tokens.filter(t => t === term).length;
+          if (!tfRaw) continue;
+          const tf = tfRaw / docLen;
           const s = (scores.get(d.id) || 0) + tf * idf;
           scores.set(d.id, s);
         }
       }
-      const arr = Array.from(scores.entries()).sort((a,b)=>b[1]-a[1]).slice(0, k).map(([id, score]) => ({ id, score }));
-      return arr;
+      const entries = Array.from(scores.entries()).sort((a,b)=>b[1]-a[1]).slice(0, k);
+      const topScore = entries.length ? entries[0][1] : 1;
+      return entries.map(([id, score]) => ({ id, score, norm: topScore > 0 ? score / topScore : 0 }));
     }
   };
+}
+
+function extractTimestampSeconds(text) {
+  const normalized = (text || '').replace(/\s+/g, ' ');
+  if (!normalized) return null;
+  const colonRegex = /(\d{1,2}):(\d{2})(?::(\d{2}))?/g;
+  let match;
+  while ((match = colonRegex.exec(normalized))) {
+    const part1 = Number.parseInt(match[1], 10);
+    const part2 = Number.parseInt(match[2], 10);
+    if (Number.isNaN(part1) || Number.isNaN(part2)) continue;
+    const hasHour = match[3] != null;
+    const part3 = hasHour ? Number.parseInt(match[3], 10) : 0;
+    if (Number.isNaN(part3)) continue;
+    const hours = hasHour ? part1 : 0;
+    const minutes = hasHour ? part2 : part1;
+    const seconds = hasHour ? part3 : part2;
+    if (seconds >= 60) continue;
+    if (!hasHour && minutes >= 180) continue;
+    const total = hours * 3600 + minutes * 60 + seconds;
+    if (total >= 0) return total;
+  }
+  const hmsRegex = /(\d+)\s*h(?:ours?)?\s*(\d+)?\s*m?(?:in(?:utes?)?)?\s*(\d+)?\s*s?/i;
+  const hmsMatch = normalized.match(hmsRegex);
+  if (hmsMatch) {
+    const hours = Number.parseInt(hmsMatch[1] || '0', 10) || 0;
+    const minutes = Number.parseInt(hmsMatch[2] || '0', 10) || 0;
+    const seconds = Number.parseInt(hmsMatch[3] || '0', 10) || 0;
+    const total = hours * 3600 + minutes * 60 + seconds;
+    if (total > 0) return total;
+  }
+  return null;
+}
+
+function clusterSimilarComments(index, comments, anchorIdx, options = {}) {
+  const anchor = comments[anchorIdx];
+  if (!anchor) return [];
+  const maxResults = options.k || 8;
+  const threshold = options.minNorm ?? 0.35;
+  const matches = index.search(anchor.text || '', maxResults);
+  if (!matches.length) return [];
+  const cluster = [];
+  const topScore = matches.length ? matches[0].score : 0;
+  for (const m of matches) {
+    const comment = comments[m.id];
+    if (!comment) continue;
+    if (m.id === anchorIdx) {
+      cluster.push({ comment, score: 1, isAnchor: true });
+      continue;
+    }
+    const norm = m.norm != null ? m.norm : (topScore > 0 ? m.score / topScore : 0);
+    if (norm < threshold) continue;
+    cluster.push({ comment, score: norm, isAnchor: false });
+  }
+  if (!cluster.some(entry => entry.isAnchor)) {
+    cluster.unshift({ comment: anchor, score: 1, isAnchor: true });
+  }
+  return cluster;
 }
 
 async function ensureAiSession() {
@@ -225,31 +256,6 @@ async function classifyEmotion(session, text) {
     if (out?.emotion && EMOTIONS.includes(out.emotion)) return out;
   } catch (_) {}
   return { emotion: 'insightful', confidence: 0.0 };
-}
-
-async function pickBestWindow(session, commentText, candidates) {
-  if (!candidates?.length) return null;
-  if (!session) {
-    const top = candidates[0];
-    if (!top) return null;
-    return { start: top.win.start, end: top.win.end, reason: 'Top lexical match' };
-  }
-  const schema = {
-    type: 'object',
-    properties: { start: {type:'number'}, end:{type:'number'}, reason:{type:'string'} },
-    required: ['start','end']
-  };
-  const windowsText = candidates.map((c,i)=>`[${i}] ${Math.round(c.win.start)}-${Math.round(c.win.end)}: ${c.win.text}`).join('\n');
-  const prompt = `You get a viewer comment and K transcript windows with timestamps.\n` +
-    `Pick the single best-matching window. Return {"start":s,"end":e,"reason":...}.\n` +
-    `Comment: ${commentText}\n` +
-    `Windows:\n${windowsText}`;
-  try {
-    const res = await session.prompt(prompt, { responseConstraint: schema });
-    const out = Util.safeJsonFromText(res);
-    if (out?.start != null && out?.end != null) return out;
-  } catch (_) {}
-  return null;
 }
 
 function scoreMoment(similarity, likes, confidence, toxicityPenalty = 0) {
@@ -286,7 +292,7 @@ async function generateTitle(session, text, commentText) {
       const schema = { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] };
       const res = await session.prompt(
         `Write a concise 4-8 word title for this video moment. Return JSON only.\n` +
-        `Transcript window: ${text}\nComment hint: ${commentText || ''}`,
+        `Context: ${text}\nAnchor comment: ${commentText || ''}`,
         { responseConstraint: schema }
       );
       const out = Util.safeJsonFromText(res);
@@ -318,18 +324,6 @@ async function analyze() {
       return;
     }
 
-    state.windows = await Util.fetchTranscriptWindows(state.videoId, { windowSizeSec: 7 });
-    if (!state.windows.length) {
-      const tracks = await gatherCaptionDebug();
-      state.moments = [];
-      renderMarkers();
-      postMomentsUpdate();
-      postStatus('noTranscript', { tracks });
-      state.processing = false;
-      return;
-    }
-    state.index = buildIndex(state.windows);
-
     const key = await getApiKey();
     if (!key) {
       state.comments = [];
@@ -341,30 +335,58 @@ async function analyze() {
     state.comments = await fetchTopComments(state.videoId);
     if (!state.comments.length) {
       postStatus('noComments');
+      state.moments = [];
+      renderMarkers();
+      postMomentsUpdate();
+      saveCachedMoments(state.videoId, state.moments);
+      state.processing = false;
+      return;
     }
+    const timestamped = state.comments
+      .map((c, idx) => ({ idx, comment: c, time: extractTimestampSeconds(c.text) }))
+      .filter(entry => entry.time != null);
+
+    if (!timestamped.length) {
+      state.moments = [];
+      renderMarkers();
+      postMomentsUpdate();
+      postStatus('noTimestamps');
+      saveCachedMoments(state.videoId, state.moments);
+      state.processing = false;
+      return;
+    }
+
+    const index = buildIndexFromComments(state.comments);
     const session = await ensureAiSession();
 
+    const sortedAnchors = timestamped.sort((a, b) => (b.comment.likes || 0) - (a.comment.likes || 0));
     const moments = [];
-    for (const c of state.comments) {
-      const top = state.index.search(c.text, 6).map(r => ({ r, win: state.windows[r.id] }));
-      const pick = await pickBestWindow(session, c.text, top);
-      const emo = await classifyEmotion(session, c.text);
-      const similarity = top.length ? top[0].r.score : 0;
-      if (pick) {
-        const title = await generateTitle(session, top[0]?.win?.text || '', c.text);
-        const m = {
-          start: Math.max(0, pick.start),
-          end: Math.max(pick.start, pick.end),
-          reason: pick.reason || '',
-          emotion: emo.emotion,
-          confidence: emo.confidence,
-          comment: c.text,
-          likes: c.likes,
-          title,
-          score: scoreMoment(similarity, c.likes, emo.confidence, 0),
-        };
-        moments.push(m);
-      }
+    for (const anchor of sortedAnchors) {
+      const cluster = clusterSimilarComments(index, state.comments, anchor.idx, { k: 10, minNorm: 0.3 });
+      if (!cluster.length) continue;
+      const totalLikes = cluster.reduce((sum, entry) => sum + (entry.comment.likes || 0), 0);
+      const supportScore = Math.min(1, cluster.length / 5);
+      const clusterText = cluster.map(entry => entry.comment.text).join(' ');
+      const emo = await classifyEmotion(session, clusterText || anchor.comment.text || '');
+      const title = await generateTitle(session, clusterText || '', anchor.comment.text || '');
+      const sampleComments = cluster.filter(entry => !entry.isAnchor).slice(0, 3).map(entry => entry.comment.text);
+      const moment = {
+        start: Math.max(0, anchor.time),
+        end: Math.max(0, anchor.time + 5),
+        reason: cluster.length > 1 ? `Cluster of ${cluster.length} similar comments` : 'Timestamped comment highlight',
+        emotion: emo.emotion,
+        confidence: emo.confidence,
+        comment: anchor.comment.text,
+        likes: totalLikes,
+        title,
+        score: scoreMoment(supportScore, totalLikes, emo.confidence, 0),
+        clusterSize: cluster.length,
+        totalLikes,
+        sampleComments,
+        anchorAuthor: anchor.comment.author || '',
+        anchorLikes: anchor.comment.likes || 0,
+      };
+      moments.push(moment);
     }
 
     const deduped = dedupeByTime(moments, 10).sort((a,b)=>b.score-a.score).slice(0, 30);
@@ -387,7 +409,6 @@ function handleSpaNavigation() {
       last = location.href;
       // reset
       state.videoId = null;
-      state.windows = [];
       state.comments = [];
       state.moments = [];
       renderMarkers();
@@ -409,49 +430,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'triggerAnalyze') {
     analyze();
   }
-  if (msg?.type === 'forceFetchTranscript') {
-    (async () => {
-      try {
-        const vssIds = Array.isArray(msg.vssIds) ? msg.vssIds : [];
-        const windows = await Util.fetchTranscriptWindows(state.videoId || Util.getVideoIdFromUrl(location.href), {
-          windowSizeSec: 7,
-          vssIds,
-          langs: vssIds, // try these directly
-        });
-        if (windows && windows.length) {
-          state.windows = windows;
-          // Minimal mark to let user proceed: set a fake moment so UI unlocks
-          state.moments = [];
-          renderMarkers();
-          postStatus('done', { from: 'force', windows: windows.length });
-        } else {
-          postStatus('noTranscript', { forced: vssIds });
-        }
-      } catch (e) {
-        postStatus('noTranscript', { error: String(e) });
-      }
-    })();
-  }
 });
-
-// Listen for in-page bridge messages to capture caption tracks ASAP
-window.addEventListener('message', (ev) => {
-  try {
-    const data = ev.data || {};
-    if (data && data.source === 'yt-moments' && data.type === 'captionTracks' && Array.isArray(data.tracks)) {
-      if (typeof Util.setPlayerCaptionTracks === 'function') Util.setPlayerCaptionTracks(
-        data.tracks.map(t => ({
-          lang_code: t.languageCode || '',
-          kind: t.kind || '',
-          name: t.name || '',
-          vss_id: t.vssId || '',
-          baseUrl: t.baseUrl || '',
-          is_default: !!t.isDefault,
-        }))
-      );
-    }
-  } catch (_) {}
-}, true);
 
 handleSpaNavigation();
 injectInpageBridge();
