@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Moments Timeline (AI)",
+  "description": "Timeline pins from top comments aligned to transcript, with on-device AI.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Moments"
+  },
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://*.youtube.com/*",
+    "https://www.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/watch*"],
+      "js": ["util.js", "contentScript.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inpageBridge.js"],
+      "matches": ["*://*.youtube.com/*"]
+    }
+  ],
+  "side_panel": {
+    "default_path": "side_panel.html"
+  },
+  "options_page": "options.html"
+}
+
+

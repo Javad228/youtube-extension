@@ -1,0 +1,84 @@
+/* Overlay on the YouTube player */
+.yt-moments-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 6px;
+  background: rgba(255,255,255,0.15);
+  z-index: 1000;
+  pointer-events: auto;
+}
+
+.yt-moments-overlay .marker {
+  position: absolute;
+  top: 0;
+  width: 6px;
+  height: 100%;
+  transform: translateX(-50%);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.yt-moments-overlay .marker[data-emotion="funny"] { background: #fbc02d; }
+.yt-moments-overlay .marker[data-emotion="sad"] { background: #4fc3f7; }
+.yt-moments-overlay .marker[data-emotion="wholesome"] { background: #66bb6a; }
+.yt-moments-overlay .marker[data-emotion="insightful"] { background: #ab47bc; }
+.yt-moments-overlay .marker[data-emotion="angry"] { background: #ef5350; }
+.yt-moments-overlay .marker[data-emotion="wtf"] { background: #8d6e63; }
+
+/* Side panel basic styles */
+.sp-container {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.35;
+  color: #1f1f1f;
+  padding: 12px;
+}
+.sp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.sp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sp-item {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 8px;
+}
+.sp-item .row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot.funny { background: #fbc02d; }
+.dot.sad { background: #4fc3f7; }
+.dot.wholesome { background: #66bb6a; }
+.dot.insightful { background: #ab47bc; }
+.dot.angry { background: #ef5350; }
+.dot.wtf { background: #8d6e63; }
+
+.filters {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.filters label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+
